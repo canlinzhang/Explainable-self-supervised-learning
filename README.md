@@ -1,0 +1,3 @@
+We believe that there are two principles of artificial intelligence:
+1. The machine should learn to represent as much information as possible with as little information as possible. When this is optimized, the little information will become a law, or regularity. Equivalently, that much informaiton being represented becomes explainable. Equivalently, the data/world becomes meaningful/explainable to the machine.
+2. The machine should use an evolutionary way to achieve this optimization: At beginning, the machine may not know how to optimize this goal. But the machine can evolute to become better and better in representing large amount of information into small amount. Then finally the machine can converge to the optimal.
