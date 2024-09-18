@@ -476,6 +476,8 @@ if __name__ == "__main__":
 
     for epoch in range(num_epochs):
 
+        model.train()
+
         current_lr = adjust_learning_rate_cosine(optimizer, original_lr, epoch, num_epochs)
         print('current learning rate', epoch, current_lr)
         

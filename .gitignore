@@ -12,6 +12,9 @@
 *.iso
 *.dmg
 
+# Ignore Mac OS system files
+.DS_Store
+
 # Add additional file types if needed
 data/
 model_bin/
