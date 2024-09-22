@@ -20,3 +20,6 @@ data/
 model_bin/
 results/
 code/imagenet-autoencoder/results/
+
+#specific file
+code/test_1/list/imagenet_full_train_list.txt
