@@ -574,6 +574,7 @@ if __name__ == "__main__":
             if (i+1) % 5000 == 0:
                 evaluate_model(val_list=val_file_list, model=model, batch_size=8, epoch=epoch, 
                                iteration=(i+1), save_dir=save_dir_img)
+                model.train()
 
         if (epoch+1) % 1 == 0:
             # Save checkpoint after each epoch
