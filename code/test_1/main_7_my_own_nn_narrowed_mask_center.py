@@ -38,17 +38,20 @@ from PIL import Image, ImageFilter
 ####Deep Network###############
 ###############################
 ##we mimic VGG model with [2,2,4,4,4]. Is it VGG 16 or VGG19?
-#anyway, we each block as 2, 2, 4, 4, 4 conv layers followed by a maxpooling in first three blocks
-#In block 4 and 5 the max-pooling is removed.
-#following the ImageNet Autoencoder model we have: For the five blockers:
+#anyway, we each block as 2, 2, 4, 4, 4 conv layers followed by a maxpooling
+#Originally, the ImageNet Autoencoder model we have: For the five blockers:
 # input_dim=3,   output_dim=64,  hidden_dim=64,  layers=configs[0], enable_bn=True
 # input_dim=64,  output_dim=128, hidden_dim=128, layers=configs[1], enable_bn=True
 # input_dim=128, output_dim=256, hidden_dim=256, layers=configs[2], enable_bn=True
 # input_dim=256, output_dim=512, hidden_dim=512, layers=configs[3], enable_bn=True
 # input_dim=512, output_dim=512, hidden_dim=512, layers=configs[4], enable_bn=True
 
+#But now, we want to narrow down the middle hidden layer to build the "small amount of information part"
+#We will first reduce cnn filter number. Then, we will add fully connected layers.
+
+
 class Encoder(nn.Module):
-    def __init__(self, latent_dim=64):
+    def __init__(self, latent_dim):
         super(Encoder, self).__init__()
         self.encoder = nn.Sequential(
 
@@ -110,26 +113,56 @@ class Encoder(nn.Module):
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
 
-            #nn.MaxPool2d(kernel_size=2, stride=2),
-
             ####block five#############
             nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
 
-            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(512),
+            nn.Conv2d(512, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
 
-            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(512),
+            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
 
-            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(512),
+            nn.Conv2d(256, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
 
-            #nn.MaxPool2d(kernel_size=2, stride=2)
+            ####block six#############
+            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(32, 16, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+
+            ####linear layers#########
+            nn.Flatten(),  # Flatten the output of conv layer
+            nn.Linear(16 * 28 * 28, 512),  # Adjust 512 as needed
+            nn.Tanh(),
+            
+            nn.Linear(512, latent_dim),  # Adjust 128 as needed
+            nn.Tanh()
+
         )
 
     def forward(self, x):
@@ -144,24 +177,56 @@ class Encoder(nn.Module):
     
 
 class Decoder(nn.Module):
-    def __init__(self, latent_dim=1):
+    def __init__(self, latent_dim):
         super(Decoder, self).__init__()
         self.decoder = nn.Sequential(
 
+            ###linear layers##############
+            nn.Linear(latent_dim, 512),
+            nn.Tanh(),
+            
+            nn.Linear(512, 16 * 28 * 28),
+            nn.Tanh(),
+            
+            nn.Unflatten(1, (16, 28, 28)),
+
+            ####block six#################
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
+
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1),
+
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
+
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
+
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, stride=1, padding=1),
+
             ####block five#################
-            #nn.ConvTranspose2d(in_channels=512, out_channels=512, kernel_size=2, stride=2),
-
-            nn.BatchNorm2d(512),
+            nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
 
-            nn.BatchNorm2d(512),
+            nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
-            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1),
 
-            nn.BatchNorm2d(512),
+            nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
-            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
 
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
@@ -241,7 +306,7 @@ class Decoder(nn.Module):
 
 
 class Autoencoder(nn.Module):
-    def __init__(self, latent_dim=64):
+    def __init__(self, latent_dim):
         super(Autoencoder, self).__init__()
         self.encoder = Encoder(latent_dim)
         self.decoder = Decoder(latent_dim)
@@ -354,7 +419,7 @@ def save_checkpoint(state, filename):
     torch.save(state, filename)
 
 
-def evaluate_model(val_list, model, batch_size, epoch, save_dir='./saved_img/'):
+def evaluate_model(val_list, model, batch_size, epoch, iteration, save_dir='./saved_img/'):
   
     # Remove previous images if the folder exists
     if epoch == 0:
@@ -407,7 +472,7 @@ def evaluate_model(val_list, model, batch_size, epoch, save_dir='./saved_img/'):
             # Save the grid image to the directory
             fig.suptitle(f'Epoch {epoch} - Image Pairs (Set {large_images_saved + 1})')
             fig.tight_layout()
-            plt.savefig(os.path.join(save_dir, f'epoch_{epoch}_image_pairs_set_{large_images_saved + 1}.png'))
+            plt.savefig(os.path.join(save_dir, f'epoch_{epoch}_iteration_{iteration}_image_pairs_set_{large_images_saved + 1}.png'))
             plt.close(fig)
 
             images_saved += len(input_imgs)
@@ -417,6 +482,12 @@ def evaluate_model(val_list, model, batch_size, epoch, save_dir='./saved_img/'):
             if large_images_saved >= 10:
                 break
 
+# crop center region for masked back-propagation
+def get_center_crop(tensor, size=64):
+    _, _, H, W = tensor.shape
+    start_h = (H - size) // 2
+    start_w = (W - size) // 2
+    return tensor[:, :, start_h:start_h+size, start_w:start_w+size]
 
 
 
@@ -430,9 +501,10 @@ if __name__ == "__main__":
     original_weight_decay = 1e-4
     original_batch_size = 32
     num_epochs = 10
-    save_dir_img = './saved_images_main_5_Sept_21_2024/'
-    save_path = "../../model_bin/main_5_Sept_21_2024/" # Define the path where you want to save the checkpoints
-    log_dir = "./log_main_5_Sept_21_2024/" # Ensure the log directory exists
+    latent_dim = 128
+    save_dir_img = './saved_images_main_7_Oct_10_2024/'
+    save_path = "../../model_bin/main_7_Oct_10_2024/" # Define the path where you want to save the checkpoints
+    log_dir = "./log_main_7_Oct_10_2024/" # Ensure the log directory exists
     train_file_list = './list/imagenet_full_train_list.txt'
     val_file_list = './list/imagenet_full_val_list.txt'
 
@@ -454,7 +526,7 @@ if __name__ == "__main__":
                         format='%(asctime)s %(message)s',
                         datefmt='%Y-%m-%d %H:%M:%S')
 
-    model = Autoencoder()
+    model = Autoencoder(latent_dim=latent_dim)
 
     # Define the device (use GPU if available)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -489,9 +561,22 @@ if __name__ == "__main__":
             input = input.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
 
+            # In the training loop:
             output = model(input)
 
-            loss = criterion(output, target)
+            # Create a mask for the central region
+            mask = torch.zeros_like(output)
+            _, _, H, W = output.shape
+            start_h = (H - 64) // 2
+            start_w = (W - 64) // 2
+            mask[:, :, start_h:start_h+64, start_w:start_w+64] = 1
+
+            # Apply the mask to both output and target
+            output_masked = output * mask
+            target_masked = target * mask
+
+            # Calculate loss on the masked tensors
+            loss = criterion(output_masked, target_masked)
 
             # compute gradient and do solver step
             optimizer.zero_grad()
@@ -504,6 +589,11 @@ if __name__ == "__main__":
             if i % 10 == 0:
                 log_entry = f"Epoch {epoch}, Step {i}, Loss: {loss.item()}, Learning Rate: {current_lr}"
                 logging.info(log_entry)  # Log to file
+
+            if (i+1) % 5000 == 0:
+                evaluate_model(val_list=val_file_list, model=model, batch_size=8, epoch=epoch, 
+                               iteration=(i+1), save_dir=save_dir_img)
+                model.train()
 
         if (epoch+1) % 1 == 0:
             # Save checkpoint after each epoch
@@ -519,7 +609,7 @@ if __name__ == "__main__":
             save_checkpoint(checkpoint, filename=checkpoint_filename)
 
         evaluate_model(val_list=val_file_list, model=model, batch_size=8, epoch=epoch, 
-                       save_dir=save_dir_img)
+                       iteration=len(train_loader), save_dir=save_dir_img)
 
 
 
