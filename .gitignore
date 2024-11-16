@@ -23,6 +23,14 @@ code/imagenet-autoencoder/results/
 
 #specific file
 code/test_1/list/imagenet_full_train_list.txt
+
 code/test_1/log_main_6_Sept_24_2024/
+
+code/test_1/saved_images_main_3_Sept_17_2024/
+code/test_1/saved_images_main_4_Sept_19_2024/
+code/test_1/saved_images_main_5_Sept_21_2024/
 code/test_1/saved_images_main_6_Sept_24_2024/
 code/test_1/saved_images_main_7_Oct_10_2024/
+
+#don't want to save images to remote
+code/test_1/saved_images*
