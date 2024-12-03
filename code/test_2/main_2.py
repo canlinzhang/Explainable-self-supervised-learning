@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import copy
 import argparse
+import gc
 
 from functools import reduce
 from torchvision import datasets, transforms
@@ -373,7 +374,7 @@ class AutoencoderOptimizer:
 
         # Create an evaluator instance
         self.evaluator = AutoencoderEvaluator(self.alpha)
-        
+
         # Build and shuffle index list
         self.index_list = list(range(self.total_ids))
         random.shuffle(self.index_list)
@@ -402,35 +403,57 @@ class AutoencoderOptimizer:
         self.decay_rate = 0.0
 
     def optimize(self, num_epochs):
-        
+        # Move optimal autoencoder to GPU before starting optimization
+        self.optimal_autoencoder = self.optimal_autoencoder.to('cuda')
+
         for epoch in range(self.start_epoch, self.start_epoch + num_epochs):
             
             # Iterate through each segment and update autoencoder
             with tqdm(range(len(self.segments)), desc='optimizing', unit='segment') as pbar:
                 for i_1 in pbar:
-                    torch.cuda.empty_cache()  # Free GPU memory to avoid OOM issues
+                    torch.cuda.empty_cache()  # Free GPU memory to avoid OOM issues if necessary
 
                     segment = self.segments[i_1]
 
                     # deepcopy to make the optimal AE for use in this step. Otherwise update parameter will change
                     # the parameters of the optimal AE !!!
                     optimal_auto_temp = copy.deepcopy(self.optimal_autoencoder)
-                    
+
                     # Update autoencoder parameters according to the current segment
-                    self.autoencoder = self.updater.update_parameters_by_indices(optimal_auto_temp, segment, self.gamma)
-                    
+                    autoencoder = self.updater.update_parameters_by_indices(optimal_auto_temp, segment, self.gamma)
+
+                    # Move updated autoencoder to GPU for forward pass
+                    autoencoder = autoencoder.to('cuda')
+
                     # Randomly sample N images from the MNIST training dataset
                     sampled_images, sampled_labels = next(iter(self.data_loader))
-                    
+
+                    # Move sampled images to GPU for forward pass
+                    sampled_images_gpu = sampled_images.to('cuda')
+
                     # Calculate the accuracy for the updated autoencoder with the sampled images
                     # Use the autoencoder to reconstruct the sampled images
-                    encoder_current = self.autoencoder.encoder(sampled_images)
-                    reconstructed_current = self.autoencoder(sampled_images)  # Reconstructed images
+                    with torch.no_grad():
+                        encoder_current = autoencoder.encoder(sampled_images_gpu)  # Runs on GPU
+                        reconstructed_current = autoencoder(sampled_images_gpu)    # Runs on GPU
+
+                        # Move tensors back to CPU for evaluation
+                        encoder_current = encoder_current.cpu()
+                        reconstructed_current = reconstructed_current.cpu()
+
+                    # Evaluate on CPU using the original sampled_images
                     final_current, non_cur, z_cur = self.evaluator.evaluate_batch(encoder_current, sampled_images, reconstructed_current)
 
                     # Calculate the accuracy for the optimal autoencoder with the sampled images
-                    encoder_optimal = self.optimal_autoencoder.encoder(sampled_images)
-                    reconstructed_optimal = self.optimal_autoencoder(sampled_images)  # Reconstructed images
+                    with torch.no_grad():
+                        encoder_optimal = self.optimal_autoencoder.encoder(sampled_images_gpu)  # Runs on GPU
+                        reconstructed_optimal = self.optimal_autoencoder(sampled_images_gpu)    # Runs on GPU
+
+                        # Move tensors back to CPU for evaluation
+                        encoder_optimal = encoder_optimal.cpu()
+                        reconstructed_optimal = reconstructed_optimal.cpu()
+
+                    # Evaluate on CPU using the original sampled_images
                     final_optimal, non_opt, z_opt = self.evaluator.evaluate_batch(encoder_optimal, sampled_images, reconstructed_optimal)
 
                     # Update progress bar with accuracy
@@ -440,9 +463,11 @@ class AutoencoderOptimizer:
 
                     # If the current autoencoder performs better, update the optimal autoencoder
                     if final_current > final_optimal:
-                        self.optimal_autoencoder.load_state_dict(self.autoencoder.state_dict())
+                        self.optimal_autoencoder.load_state_dict(autoencoder.state_dict())
                         self.optimal_score = final_current
-                        #print('updated optimal autoencoder!!!')
+
+                    del(optimal_auto_temp, autoencoder)
+                    torch.cuda.empty_cache()  # Free GPU memory if needed
 
             self.index_list = list(range(self.total_ids))
             random.shuffle(self.index_list)
@@ -456,6 +481,9 @@ class AutoencoderOptimizer:
             if not os.path.exists(self.save_dir):
                 os.makedirs(self.save_dir)
             torch.save(self.optimal_autoencoder, f'{self.save_dir}optimal_autoencoder_model_epoch_{epoch}.pth')
+
+        # Move the optimal autoencoder back to CPU after all epochs are complete
+        self.optimal_autoencoder = self.optimal_autoencoder.to('cpu')
 
         print("Optimization complete. Best accuracy: {:.3f}%".format(self.optimal_score))
 
@@ -484,8 +512,9 @@ if __name__ == "__main__":
 
     elif args.mode == 'eval':
         # Load a saved autoencoder model to evaluate
-        checkpoint_path = '../../model_bin/test_2_main_1_Dec_1_2024/optimal_autoencoder_model_epoch_9.pth'  # Replace '9' with the epoch number you want to load
+        checkpoint_path = '../../model_bin/test_2_main_1_Dec_1_2024/optimal_autoencoder_model_epoch_17.pth'  # Replace '9' with the epoch number you want to load
         autoencoder = torch.load(checkpoint_path)
+        autoencoder = autoencoder.to('cpu')  # Move to CPU
         autoencoder.eval()  # Set to evaluation mode
 
         # Load MNIST dataset for evaluation
