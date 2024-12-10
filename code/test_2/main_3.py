@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import copy
 import argparse
+import gc
 
 from functools import reduce
 from torchvision import datasets, transforms
@@ -30,7 +31,8 @@ class Encoder(nn.Module):
             nn.BatchNorm2d(32),
             nn.Conv2d(32, 32, kernel_size=3, stride=2, padding=1),  # Output: [batch_size, 32, 7, 7]
             nn.ReLU(),
-            nn.BatchNorm2d(32)
+            nn.BatchNorm2d(32),
+            nn.Tanh()  # Output range is now between -1 and 1
         )
 
     def quantize(self, z):
@@ -260,6 +262,120 @@ class UpdateParameters():
         return autoencoder
 
 
+# Define a class to calculate encoder non-zero dimensions and information captured
+class AutoencoderEvaluator:
+    def __init__(self, alpha, M):
+        # the final return is:
+        # captured information * alpha + compression_rate
+        # We may keep alpha = 0 for just focus on compression rate
+        self.alpha = alpha
+        self.M = M
+
+    #we may or may not use this func !!!!!
+    def count_non_zero_dimensions(self, encoder_output):
+        # Count non-zero values in each (num_filter, h, w) tensor along the channel axis
+        batch_size = encoder_output.shape[0]
+        non_zero_count = []
+        zero_count = []
+        for i in range(batch_size):
+            non_zero_dims = torch.sum(encoder_output[i] != 0, dim=(1, 2))  # Count non-zero values for each channel (dim 1)
+            total_non_zero = torch.sum(non_zero_dims)  # Sum across all channels to get total non-zero values
+            total_zero = encoder_output[i].numel() - total_non_zero  # Total elements minus non-zero elements
+            non_zero_count.append(total_non_zero.item())
+            zero_count.append(total_zero.item())
+        return non_zero_count, zero_count
+
+    def calculate_information(self, encoder_output, num_bins=32):
+        """
+        Calculate the amount of information required to represent each batch's encoder output.
+
+        Args:
+            encoder_output (torch.Tensor): The output of the encoder with shape (batch_size, num_filters, h', w').
+            num_bins (int): The number of quantized levels (default is 32).
+
+        Returns:
+            information_list (list): A list where each element is the amount of information for a batch sample.
+        """
+        # Flatten the entire encoder output to calculate the global probability distribution
+        flattened_output = encoder_output.flatten()  # Shape: (batch_size * num_filters * h' * w',)
+
+        # Scale the values to range [0, num_bins - 1] and convert to integer indices
+        quantized_indices = (flattened_output * (num_bins - 1)).round().to(torch.int64)
+
+        # Calculate histogram to get counts of each value (0, 1, ..., num_bins-1)
+        histogram = torch.bincount(quantized_indices, minlength=num_bins).float()
+        total_elements = flattened_output.numel()
+
+        # Calculate probabilities (p0, p1, ..., p31)
+        probabilities = histogram / total_elements  # Shape: (num_bins,)
+
+        # Avoid log(0) by masking zero probabilities
+        probabilities[probabilities == 0] = 1e-12  # Add a small value to avoid log(0)
+
+        # Compute -log2(pi) for all probabilities
+        log_probabilities = -torch.log2(probabilities)
+
+        # Reshape the encoder output back to batch-wise dimensions
+        batch_size, num_filters, h_prime, w_prime = encoder_output.shape
+
+        # Calculate information for each batch
+        information_list = []
+        for i in range(batch_size):
+            # Scale the batch values to quantized indices
+            batch_quantized_indices = (encoder_output[i].flatten() * (num_bins - 1)).round().to(torch.int64)
+
+            # Count the occurrences of each quantized value in the current batch
+            batch_histogram = torch.bincount(
+                batch_quantized_indices, minlength=num_bins
+            ).float()
+
+            # Compute the total information for the current batch
+            batch_information = torch.sum(batch_histogram * log_probabilities).item()
+            information_list.append(batch_information)
+
+        return information_list
+
+    def evaluate_batch(self, encoder_output, original_images, reconstructed_images):
+        """
+        Compute the information compression rate of the autoencoder.
+
+        Args:
+            encoder_output (torch.Tensor): Encoder output with shape (batch_size, num_filters, h', w').
+            original_images (torch.Tensor): Original images with shape (batch_size, 1, H, W).
+            reconstructed_images (torch.Tensor): Reconstructed images with shape (batch_size, 1, H, W).
+
+        Returns:
+            float: The final compression rate score.
+        """
+        # Calculate information in original images
+        information_original = self.calculate_information(original_images, num_bins=256)
+
+        # Calculate information in encoder output
+        information_encoder = self.calculate_information(encoder_output, num_bins=32)
+
+        # Compute residual images
+        residual_images = original_images - reconstructed_images
+
+        # Normalize residual images to range [0, 1]
+        residual_images = (residual_images + 1) / 2
+
+        # Calculate information in residual images
+        information_residual = self.calculate_information(residual_images, num_bins=512)
+
+        # Calculate information obtained by reconstruction
+        information_reconstruct = [max(0, orig - resid) for orig, resid in zip(information_original, information_residual)]
+
+        # Calculate compression rate for each batch
+        compress_batch = [reconstruct / (encoder + 1e-12) for reconstruct, encoder in zip(information_reconstruct, information_encoder)]
+
+        # Sort and take the top M compression rates
+        top_compression_rates = sorted(compress_batch, reverse=True)[:self.M]
+
+        # Return the final compression rate score
+        final_score = sum(top_compression_rates)
+        return final_score, information_original, information_residual, information_reconstruct, information_encoder
+
+
 '''
 First, get layer_dict and number of total parameters by
 helper = ObtainIndexForParameters(autoencoder)
@@ -283,12 +399,29 @@ we over-write the optimal autoencoder parameters by the current updated autoenco
 Then, move to the next step. Do this until the for loop ends.
 '''
 class AutoencoderOptimizer:
-    def __init__(self, autoencoder, K=15, N=2000, gamma=0.05, dataset_path='../../data/MNIST/'):
+    def __init__(self, autoencoder, K=20, N=2000, M=100, gamma=0.1, alpha=0.0, 
+                 dataset_path='../../data/MNIST/',
+                 save_dir='../../model_bin/test_2_main_1_Dec_7_2024/'):
         self.autoencoder = autoencoder
         self.K = K
         self.N = N
         self.gamma = gamma
+        self.alpha = alpha
         self.dataset_path = dataset_path
+        self.save_dir = save_dir
+        self.M = M
+        
+        # Load latest checkpoint if available
+        self.start_epoch = 0
+        if os.path.exists(self.save_dir):
+            checkpoint_files = [f for f in os.listdir(self.save_dir) if f.startswith('optimal_autoencoder_model_epoch_') and f.endswith('.pth')]
+            if checkpoint_files:
+                checkpoint_files.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]), reverse=True)
+                latest_checkpoint = checkpoint_files[0]
+                checkpoint_path = os.path.join(self.save_dir, latest_checkpoint)
+                self.autoencoder.load_state_dict(torch.load(checkpoint_path).state_dict())
+                self.start_epoch = int(latest_checkpoint.split('_')[-1].split('.')[0]) + 1
+                print(f'Loaded checkpoint: {latest_checkpoint}')
         
         # Obtain layer_dict and number of total parameters
         self.helper = ObtainIndexForParameters(self.autoencoder)
@@ -296,7 +429,10 @@ class AutoencoderOptimizer:
         
         # Initialize updater
         self.updater = UpdateParameters(self.layer_dict)
-        
+
+        # Create an evaluator instance
+        self.evaluator = AutoencoderEvaluator(self.alpha, self.M)
+
         # Build and shuffle index list
         self.index_list = list(range(self.total_ids))
         random.shuffle(self.index_list)
@@ -325,26 +461,25 @@ class AutoencoderOptimizer:
         self.decay_rate = 0.0
 
     def optimize(self, num_epochs):
-
         # Move optimal autoencoder to GPU before starting optimization
         self.optimal_autoencoder = self.optimal_autoencoder.to('cuda')
-        
-        for epoch in range(num_epochs):
+
+        for epoch in range(self.start_epoch, self.start_epoch + num_epochs):
             
             # Iterate through each segment and update autoencoder
             with tqdm(range(len(self.segments)), desc='optimizing', unit='segment') as pbar:
                 for i_1 in pbar:
-                    torch.cuda.empty_cache()  # Free GPU memory to avoid OOM issues
+                    torch.cuda.empty_cache()  # Free GPU memory to avoid OOM issues if necessary
 
                     segment = self.segments[i_1]
 
-                    #deepcopy to make the optimal AE for use in this step. Otherwise update parameter will change
-                    #the paramters of the optimal AE !!!
+                    # deepcopy to make the optimal AE for use in this step. Otherwise update parameter will change
+                    # the parameters of the optimal AE !!!
                     optimal_auto_temp = copy.deepcopy(self.optimal_autoencoder)
-                    
+
                     # Update autoencoder parameters according to the current segment
                     autoencoder = self.updater.update_parameters_by_indices(optimal_auto_temp, segment, self.gamma)
-                    
+
                     # Move updated autoencoder to GPU for forward pass
                     autoencoder = autoencoder.to('cuda')
 
@@ -353,29 +488,43 @@ class AutoencoderOptimizer:
 
                     # Move sampled images to GPU for forward pass
                     sampled_images_gpu = sampled_images.to('cuda')
-                    
+
                     # Calculate the accuracy for the updated autoencoder with the sampled images
                     # Use the autoencoder to reconstruct the sampled images
                     with torch.no_grad():
-                        outputs_current = autoencoder(sampled_images_gpu)
-                        outputs_current = outputs_current.cpu()
-                        mse_loss_current = F.mse_loss(outputs_current, sampled_images, reduction='mean').item()
-                        accuracy_current = -mse_loss_current  # Use negative MSE as a proxy for accuracy to maximize similarity
+                        encoder_current = autoencoder.encoder(sampled_images_gpu)  # Runs on GPU
+                        reconstructed_current = autoencoder(sampled_images_gpu)    # Runs on GPU
 
-                        # Calculate the accuracy for the optimal autoencoder with the sampled images
-                        outputs_optimal = self.optimal_autoencoder(sampled_images_gpu)
-                        outputs_optimal = outputs_optimal.cpu()
-                        mse_loss_optimal = F.mse_loss(outputs_optimal, sampled_images, reduction='mean').item()
-                        accuracy_optimal = -mse_loss_optimal
+                        # Move tensors back to CPU for evaluation
+                        encoder_current = encoder_current.cpu()
+                        reconstructed_current = reconstructed_current.cpu()
+
+                    # Evaluate on CPU using the original sampled_images
+                    final_current, l1, l2, l3, l4 = self.evaluator.evaluate_batch(encoder_current, sampled_images, reconstructed_current)
+
+                    # Calculate the accuracy for the optimal autoencoder with the sampled images
+                    with torch.no_grad():
+                        encoder_optimal = self.optimal_autoencoder.encoder(sampled_images_gpu)  # Runs on GPU
+                        reconstructed_optimal = self.optimal_autoencoder(sampled_images_gpu)    # Runs on GPU
+
+                        # Move tensors back to CPU for evaluation
+                        encoder_optimal = encoder_optimal.cpu()
+                        reconstructed_optimal = reconstructed_optimal.cpu()
+
+                    # Evaluate on CPU using the original sampled_images
+                    final_optimal, l1_, l2_, l3_, l4_ = self.evaluator.evaluate_batch(encoder_optimal, sampled_images, reconstructed_optimal)
 
                     # Update progress bar with accuracy
-                    pbar.set_postfix({'current_accuracy': accuracy_current, 'optimal_accuracy': accuracy_optimal})
+                    pbar.set_postfix({'cur_s': final_current, 
+                                      'opt_s': final_optimal})
 
                     # If the current autoencoder performs better, update the optimal autoencoder
-                    if accuracy_current > accuracy_optimal:
+                    if final_current > final_optimal:
                         self.optimal_autoencoder.load_state_dict(autoencoder.state_dict())
-                        self.optimal_score = accuracy_current
-                        #print('updated optimal autoencoder!!!')
+                        self.optimal_score = final_current
+
+                    del(optimal_auto_temp, autoencoder)
+                    torch.cuda.empty_cache()  # Free GPU memory if needed
 
             self.index_list = list(range(self.total_ids))
             random.shuffle(self.index_list)
@@ -386,32 +535,9 @@ class AutoencoderOptimizer:
             print('indices', self.index_list[:10], self.segments[0])
 
             # Ensure the directory exists before saving the model
-            save_dir = '../../model_bin/test_2_main_1_Nov_29_2024/'
-            if not os.path.exists(save_dir):
-                os.makedirs(save_dir)
-            torch.save(self.optimal_autoencoder, f'{save_dir}optimal_autoencoder_model_epoch_{epoch}.pth')
-
-            # Save reconstructed images for this epoch
-            save_image_dir = f'./saved_images_Nov_29_2024/saved_images_epoch_{epoch}/'
-            os.makedirs(save_image_dir, exist_ok=True)
-            with torch.no_grad():
-                reconstructed_images = self.optimal_autoencoder(sampled_images_gpu)
-                reconstructed_images_to_save = reconstructed_images.cpu()
-
-            for i in range(min(5, sampled_images.size(0))):  # Save up to 5 images
-                fig, axes = plt.subplots(1, 2)
-                # Original image
-                axes[0].imshow(sampled_images[i].squeeze().numpy(), cmap='gray')
-                axes[0].set_title('Original Image')
-                axes[0].axis('off')
-                # Reconstructed image
-                axes[1].imshow(reconstructed_images_to_save[i].squeeze().numpy(), cmap='gray')
-                axes[1].set_title('Reconstructed Image')
-                axes[1].axis('off')
-
-                # Save the figure with epoch number
-                plt.savefig(f'{save_image_dir}reconstructed_image_epoch_{epoch}_{i}.png')
-                plt.close(fig)
+            if not os.path.exists(self.save_dir):
+                os.makedirs(self.save_dir)
+            torch.save(self.optimal_autoencoder, f'{self.save_dir}optimal_autoencoder_model_epoch_{epoch}.pth')
 
         # Move the optimal autoencoder back to CPU after all epochs are complete
         self.optimal_autoencoder = self.optimal_autoencoder.to('cpu')
@@ -424,8 +550,8 @@ class AutoencoderOptimizer:
 '''
 Do
 
-python main_1.py --mode train
-python main_1.py --mode eval
+python main_3.py --mode train
+python main_3.py --mode eval
 
 to train or evaluate the model
 '''
@@ -439,13 +565,13 @@ if __name__ == "__main__":
 
         # Example usage
         autoencoder_optimizer = AutoencoderOptimizer(autoencoder)
-        autoencoder_optimizer.optimize(200)
+        autoencoder_optimizer.optimize(20)
 
     elif args.mode == 'eval':
         # Load a saved autoencoder model to evaluate
-        checkpoint_path = '../../model_bin/test_2_main_1_Nov_29_2024/optimal_autoencoder_model_epoch_14.pth'  # Replace '9' with the epoch number you want to load
+        checkpoint_path = '../../model_bin/test_2_main_1_Dec_7_2024/optimal_autoencoder_model_epoch_49.pth'  # Replace '9' with the epoch number you want to load
         autoencoder = torch.load(checkpoint_path)
-        autoencoder = autoencoder.to('cuda')
+        autoencoder = autoencoder.to('cpu')  # Move to CPU
         autoencoder.eval()  # Set to evaluation mode
 
         # Load MNIST dataset for evaluation
@@ -454,14 +580,12 @@ if __name__ == "__main__":
         data_loader = DataLoader(dataset, batch_size=10, shuffle=True)  # Load a small batch for visualization
 
         # Evaluate and save reconstructed images
-        save_image_dir = './saved_images_Nov_29_2024/'
+        save_image_dir = './saved_images_3/'
         os.makedirs(save_image_dir, exist_ok=True)
 
         sampled_images, _ = next(iter(data_loader))
-        sampled_images_gpu = sampled_images.to('cuda')
         with torch.no_grad():
-            reconstructed_images = autoencoder(sampled_images_gpu)
-            reconstructed_images = reconstructed_images.cpu()
+            reconstructed_images = autoencoder(sampled_images)
 
         # Save the original and reconstructed images
         for i in range(sampled_images.size(0)):
